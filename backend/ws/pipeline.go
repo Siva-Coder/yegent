@@ -11,9 +11,10 @@ import (
 
 	"yegent-backend/api" // Make sure to use your project's module name. wait, I'll use relative or just "yegent-backend/api" if it was that. Wait, the original pipeline.go used what? Let me check how it imported api.
 
+	"os"
+
 	"github.com/gofiber/contrib/websocket"
 	"github.com/supabase-community/supabase-go"
-	"os"
 )
 
 type Campaign struct {
@@ -23,8 +24,6 @@ type Campaign struct {
 	Greeting           string
 	LanguagePreference string
 }
-
-
 
 // HandleCallSocket bridges the Fiber HTTP request into the websocket connection loop
 var HandleCallSocket = websocket.New(func(c *websocket.Conn) {
@@ -66,13 +65,21 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 			if err == nil {
 				var results []map[string]interface{}
 				_, err = dbClient.From("campaigns").Select("*", "exact", false).Eq("id", campaignID).ExecuteTo(&results)
-				
+
 				if err == nil && len(results) > 0 {
 					row := results[0]
-					if v, ok := row["persona"].(string); ok { campaign.Persona = v }
-					if v, ok := row["objective"].(string); ok { campaign.Objective = v }
-					if v, ok := row["greeting"].(string); ok { campaign.Greeting = v }
-					if v, ok := row["language_preference"].(string); ok { campaign.LanguagePreference = v }
+					if v, ok := row["persona"].(string); ok {
+						campaign.Persona = v
+					}
+					if v, ok := row["objective"].(string); ok {
+						campaign.Objective = v
+					}
+					if v, ok := row["greeting"].(string); ok {
+						campaign.Greeting = v
+					}
+					if v, ok := row["language_preference"].(string); ok {
+						campaign.LanguagePreference = v
+					}
 					log.Println("Loaded Campaign:", campaign.LanguagePreference)
 				} else if err != nil {
 					log.Println("Failed to fetch campaign:", err)
@@ -83,12 +90,12 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 
 	// 1. Map the language preference to a strict LLM instruction
 	languageRule := "pure English"
-	fillerWords := "'Hmm,', 'Well,', 'Okay,'"
+	fillerWords := "'Well,', 'Hmm,', 'Okay,'"
 
 	switch campaign.LanguagePreference {
 	case "te-IN":
 		languageRule = "a highly casual Telugu-English code-mix using ONLY the English alphabet (Romanized Telugu). Example: 'Avunu, nenu check chestanu.' NEVER use native Telugu script."
-		fillerWords = "'Hmm,', 'Sare,', 'Okay,'"
+		fillerWords = "'Okay,', 'Hmm,', 'Sare,'"
 	case "hi-IN":
 		languageRule = "a highly casual Hindi-English code-mix using ONLY the English alphabet (Hinglish). Example: 'Haan, main check karta hoon.' NEVER use native Hindi script (Devanagari)."
 		fillerWords = "'Hmm,', 'Achha,', 'Theek hai,'"
@@ -102,7 +109,8 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 			"2. LANGUAGE: You MUST reply in %s "+
 			"3. Use English for all complex software, business, and technical terms. Use the local language for conversational glue. "+
 			"4. HUMAN CONVERSATION: Start your turns with natural filler words like %s. "+
-			"5. Keep responses to a maximum of 2 short, punchy sentences. No lists or markdown.",
+			"5. ANSWER DIRECTLY: No matter what the user asks, provide the exact answer immediately. NEVER use affirmative fluff or acknowledge the question (e.g., do NOT say 'That is a great question', 'Good choice', or 'I would love to help'). Get straight to the point but maintain a warm, human tone. "+
+			"6. Keep responses to a maximum of 2 short, punchy sentences. No lists or markdown.",
 		campaign.Persona, campaign.Objective, languageRule, fillerWords,
 	)
 
@@ -110,9 +118,9 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 	defer cancelPipeline()
 
 	// Channels
-	audioChan := make(chan []byte, 300)        // PCM from browser -> STT
-	transcriptChan := make(chan string, 10)    // STT -> LLM
-	ttsChan := make(chan api.TTSChunk, 100)    // TTS -> Browser
+	audioChan := make(chan []byte, 300)     // PCM from browser -> STT
+	transcriptChan := make(chan string, 10) // STT -> LLM
+	ttsChan := make(chan api.TTSChunk, 100) // TTS -> Browser
 
 	// Helper to launch isolated TTS streams for precise boundaries
 	spinupUtteranceTTS := func(ctx context.Context, tokens <-chan string) {
@@ -144,7 +152,9 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 			case <-pipelineCtx.Done():
 				return
 			case chunk, ok := <-ttsChan:
-				if !ok { return }
+				if !ok {
+					return
+				}
 
 				if string(chunk) == `{"type":"audio_end"}` {
 					if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"audio_end"}`)); err != nil {
@@ -176,10 +186,14 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 			case <-pipelineCtx.Done():
 				return
 			case transcript, ok := <-transcriptChan:
-				if !ok { return }
-				
+				if !ok {
+					return
+				}
+
 				transcript = strings.TrimSpace(transcript)
-				if transcript == "" { continue }
+				if transcript == "" {
+					continue
+				}
 				log.Println("STT Final:", transcript)
 
 				transcriptMutex.Lock()
@@ -190,27 +204,40 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 				if llmCancel != nil {
 					llmCancel() // Kill previous generation
 				}
-				
+
 				var reqCtx context.Context
 				reqCtx, llmCancel = context.WithCancel(pipelineCtx)
 				llmMutex.Unlock()
 
 				userMessage := transcript
-				
+
+				// Spin up TTS queue early to allow instant audio injection
+				uttTokenQueue := make(chan string, 100)
+				spinupUtteranceTTS(reqCtx, uttTokenQueue)
+
+				// Mask Latency: If it's an inquiry (more than 2 words), say "one minute" instantly
+				if len(strings.Split(userMessage, " ")) > 2 {
+					searchFiller := "Hmm, let me check... "
+					switch campaign.LanguagePreference {
+					case "te-IN":
+						searchFiller = "Okka nimisham... "
+					case "hi-IN":
+						searchFiller = "Ek minute... "
+					}
+					uttTokenQueue <- searchFiller
+				}
+
 				// Phase 14: Semantic Search (RAG)
 				contextText, _ := api.SearchKnowledgeBase(reqCtx, userMessage)
 				if contextText != "" {
 					log.Println("RAG context retrieved, enriching prompt.")
 					userMessage = fmt.Sprintf("KNOWLEDGE BASE CONTEXT:\n%s\n\nUSER SAID: %s", contextText, userMessage)
 				}
-				
+
 				log.Println("AI evaluating:", transcript)
 
 				llmLocalChan := make(chan string, 100)
 				go api.StreamLLM(reqCtx, systemPrompt, userMessage, llmLocalChan)
-
-				uttTokenQueue := make(chan string, 100)
-				spinupUtteranceTTS(reqCtx, uttTokenQueue)
 
 				// Pipe LLM to TTS
 				go func(ctx context.Context, in <-chan string, out chan<- string) {
