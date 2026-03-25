@@ -11,21 +11,22 @@ import (
 	"strings"
 )
 
-// StreamGroqLLM connects to Groq's streaming API and sends tokens to the channel
-func StreamGroqLLM(ctx context.Context, systemPrompt, userMessage string, targetChan chan<- string) {
+// StreamLLM connects to Gemini's OpenAI-compatible streaming API and sends tokens to the channel
+func StreamLLM(ctx context.Context, systemPrompt, userMessage string, targetChan chan<- string) {
 	defer close(targetChan)
 
-	apiKey := os.Getenv("GROQ_API_KEY")
+	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
-		log.Println("WARNING: GROQ_API_KEY environment variable is not set. Using mock output.")
-		targetChan <- "This is a fallback response because the Groq API key is missing."
+		log.Println("WARNING: GEMINI_API_KEY environment variable is not set. Using mock output.")
+		targetChan <- "This is a fallback response because the Gemini API key is missing. Please add it to your .env file."
 		return
 	}
 
-	url := "https://api.groq.com/openai/v1/chat/completions"
+	// Google's OpenAI-compatible endpoint
+	url := "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 	payload := map[string]interface{}{
-		"model": "llama-3.1-8b-instant",
+		"model": "gemini-2.5-flash-lite", // User specifically asked for '2.5-flash-lite'
 		"messages": []map[string]string{
 			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": userMessage},
@@ -36,7 +37,7 @@ func StreamGroqLLM(ctx context.Context, systemPrompt, userMessage string, target
 	payloadBytes, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(payloadBytes))
 	if err != nil {
-		log.Println("Failed to formulate Groq request:", err)
+		log.Println("Failed to formulate Gemini request:", err)
 		return
 	}
 
@@ -47,20 +48,23 @@ func StreamGroqLLM(ctx context.Context, systemPrompt, userMessage string, target
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != context.Canceled {
-			log.Println("Failed to connect to Groq:", err)
+			log.Println("Failed to connect to Gemini:", err)
 		}
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Println("Groq returned non-200 status:", resp.Status)
+		log.Println("Gemini returned non-200 status:", resp.Status)
+		// Read body for error details
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(resp.Body)
+		log.Println("Error body:", buf.String())
 		return
 	}
 
 	reader := bufio.NewReader(resp.Body)
 	for {
-		// Respect barge-in context
 		select {
 		case <-ctx.Done():
 			return
@@ -91,7 +95,6 @@ func StreamGroqLLM(ctx context.Context, systemPrompt, userMessage string, target
 		}
 
 		if err := json.Unmarshal([]byte(data), &sseResp); err != nil {
-			log.Printf("Failed to unmarshal Groq SSE: %v", err)
 			continue
 		}
 

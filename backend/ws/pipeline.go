@@ -80,15 +80,29 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 		}
 	}
 
+	// 1. Map the language preference to a strict LLM instruction
+	languageRule := "pure English"
+	fillerWords := "'Hmm,', 'Well,', 'Okay,'"
+
+	switch campaign.LanguagePreference {
+	case "te-IN":
+		languageRule = "a highly casual Telugu-English code-mix using ONLY the English alphabet (Romanized Telugu). Example: 'Avunu, nenu check chestanu.' NEVER use native Telugu script."
+		fillerWords = "'Hmm,', 'Sare,', 'Okay,'"
+	case "hi-IN":
+		languageRule = "a highly casual Hindi-English code-mix using ONLY the English alphabet (Hinglish). Example: 'Haan, main check karta hoon.' NEVER use native Hindi script (Devanagari)."
+		fillerWords = "'Hmm,', 'Achha,', 'Theek hai,'"
+	}
+
+	// 2. Inject the dynamic rules into the system prompt
 	systemPrompt := fmt.Sprintf(
 		"You are %s. Your objective is: %s. "+
-			"CRITICAL RULES FOR LIVE PHONE CALL: "+
-			"1. MIRROR THE USER: You MUST reply in the exact same language the user just spoke. If they speak purely English, reply ONLY in English. If they speak Telugu, reply in a casual Telugu-English mix. "+
-			"2. NEVER mix Telugu and Hindi in the same sentence. "+
-			"3. VOCABULARY LIMIT: When speaking Telugu, use EXTREMELY simple, everyday Romanized words (e.g., 'avunu', 'cheppandi', 'sare'). For any complex concepts, course details, or technical terms, use English. Do not invent complex Telugu words. "+
-			"4. HUMAN CONVERSATION: Start your turns with natural filler words (e.g., 'Hmm,', 'Okay,', 'Right,'). "+
-			"5. FORMATTING: Speak in short, punchy sentences. Maximum 2 sentences per turn. NO lists, NO bullet points, NO markdown.",
-		campaign.Persona, campaign.Objective,
+			"CRITICAL RULES: "+
+			"1. You are speaking on a live phone call in India. "+
+			"2. LANGUAGE: You MUST reply in %s "+
+			"3. Use English for all complex software, business, and technical terms. Use the local language for conversational glue. "+
+			"4. HUMAN CONVERSATION: Start your turns with natural filler words like %s. "+
+			"5. Keep responses to a maximum of 2 short, punchy sentences. No lists or markdown.",
+		campaign.Persona, campaign.Objective, languageRule, fillerWords,
 	)
 
 	pipelineCtx, cancelPipeline := context.WithCancel(context.Background())
@@ -182,7 +196,7 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 				log.Println("AI evaluating:", userMessage)
 
 				llmLocalChan := make(chan string, 100)
-				go api.StreamGroqLLM(reqCtx, systemPrompt, userMessage, llmLocalChan)
+				go api.StreamLLM(reqCtx, systemPrompt, userMessage, llmLocalChan)
 
 				uttTokenQueue := make(chan string, 100)
 				spinupUtteranceTTS(reqCtx, uttTokenQueue)

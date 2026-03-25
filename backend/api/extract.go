@@ -17,9 +17,9 @@ type ExtractedData map[string]interface{}
 // ExtractCallData runs in the background. It takes the full transcript, asks Groq to extract lead info,
 // and saves the result to the collected_leads table in Supabase.
 func ExtractCallData(ctx context.Context, campaignID, userPhone, transcript string) {
-	apiKey := os.Getenv("GROQ_API_KEY")
+	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" || transcript == "" || campaignID == "" {
-		log.Println("Skipping extraction: missing config or empty transcript")
+		log.Println("Skipping extraction: missing GEMINI_API_KEY or empty transcript")
 		return
 	}
 
@@ -29,9 +29,10 @@ You must output STRICT JSON. Include fields like "name", "appointment_time", "co
 If a field is not mentioned, omit it or set to null.
 Return ONLY valid JSON and nothing else.`
 
-	url := "https://api.groq.com/openai/v1/chat/completions"
+	// Google's OpenAI-compatible endpoint
+	url := "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 	payload := map[string]interface{}{
-		"model": "llama-3.1-8b-instant",
+		"model": "gemini-2.5-flash-lite",
 		"messages": []map[string]string{
 			{"role": "system", "content": systemInstruction},
 			{"role": "user", "content": "Transcript:\n" + transcript},
@@ -53,14 +54,14 @@ Return ONLY valid JSON and nothing else.`
 	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		log.Println("Extraction failed: Groq request error", err)
+		log.Println("Extraction failed: Gemini request error", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 
-	var groqResp struct {
+	var res struct {
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
@@ -68,12 +69,12 @@ Return ONLY valid JSON and nothing else.`
 		} `json:"choices"`
 	}
 
-	if err := json.Unmarshal(bodyBytes, &groqResp); err != nil || len(groqResp.Choices) == 0 {
+	if err := json.Unmarshal(bodyBytes, &res); err != nil || len(res.Choices) == 0 {
 		log.Println("Extraction failed: invalid response", string(bodyBytes))
 		return
 	}
 
-	content := groqResp.Choices[0].Message.Content
+	content := res.Choices[0].Message.Content
 
 	var extractedData ExtractedData
 	if err := json.Unmarshal([]byte(content), &extractedData); err != nil {
