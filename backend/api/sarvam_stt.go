@@ -5,20 +5,19 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 // StreamSarvamSTT streams audio to Sarvam AI and returns 'is_final' text strings to a channel.
-func StreamSarvamSTT(ctx context.Context, audioChan <-chan []byte, transcriptChan chan<- string, langCode string) error {
+// It also maintains a thread-safe lastTranscript for instant endpointing.
+func StreamSarvamSTT(ctx context.Context, audioChan <-chan []byte, transcriptChan chan<- string, langCode string, lastTranscript *strings.Builder, mu *sync.Mutex) error {
 	apiKey := strings.TrimSpace(os.Getenv("SARVAM_API_KEY"))
 	if apiKey == "" {
 		return fmt.Errorf("missing SARVAM_API_KEY for STT")
@@ -28,50 +27,37 @@ func StreamSarvamSTT(ctx context.Context, audioChan <-chan []byte, transcriptCha
 		langCode = "te-IN"
 	}
 
-	// Try saaras:v3 first, fall back to saarika:v2.5 if 403
-	models := []string{"saaras:v3", "saarika:v2.5"}
-	var conn *websocket.Conn
+	modelCtx := "saaras:v3"
+	params := fmt.Sprintf("model=%s&language-code=%s&sample_rate=16000&high_vad_sensitivity=true&mode=transcribe",
+		url.QueryEscape(modelCtx), url.QueryEscape(langCode))
+	wsURL := "wss://api.sarvam.ai/speech-to-text/ws?" + params
 
-	for _, model := range models {
-		params := fmt.Sprintf("model=%s&language-code=%s&sample_rate=16000&high_vad_sensitivity=true",
-			url.QueryEscape(model), url.QueryEscape(langCode))
-		if model == "saaras:v3" {
-			params += "&mode=transcribe"
+	dialer := websocket.DefaultDialer
+	headers := http.Header{}
+	headers.Add("Api-Subscription-Key", apiKey)
+
+	conn, _, err := dialer.Dial(wsURL, headers)
+	if err != nil {
+		log.Printf("STT Connection failed with %s, trying fallback model saarika:v2.5...", modelCtx)
+		modelCtx = "saarika:v2.5"
+		params = fmt.Sprintf("model=%s&language-code=%s&sample_rate=16000&high_vad_sensitivity=true",
+			url.QueryEscape(modelCtx), url.QueryEscape(langCode))
+		wsURL = "wss://api.sarvam.ai/speech-to-text/ws?" + params
+		conn, _, err = dialer.Dial(wsURL, headers)
+		if err != nil {
+			return fmt.Errorf("all STT model attempts failed: %w", err)
 		}
-		wsURL := "wss://api.sarvam.ai/speech-to-text/ws?" + params
-
-		reqHeader := http.Header{}
-		reqHeader.Set("Api-Subscription-Key", apiKey)
-
-		var resp *http.Response
-		var err error
-		conn, resp, err = websocket.DefaultDialer.Dial(wsURL, reqHeader)
-		if err == nil {
-			log.Printf("STT connected with model=%s", model)
-			break
-		}
-
-		statusCode := 0
-		body := ""
-		if resp != nil {
-			statusCode = resp.StatusCode
-			b, _ := io.ReadAll(resp.Body)
-			body = string(b)
-		}
-		log.Printf("STT dial failed (model=%s): %v HTTP %d: %s", model, err, statusCode, body)
-		conn = nil
-	}
-
-	if conn == nil {
-		return fmt.Errorf("all STT model attempts failed — check SARVAM_API_KEY permissions")
 	}
 	defer conn.Close()
 
-	// Sarvam STT requires a config payload as the very first message before any audio
+	log.Printf("STT connected with model=%s\n", modelCtx)
+
+	// Sarvam STT requires a config payload
 	configPayload := map[string]interface{}{
 		"type": "config",
 		"data": map[string]string{
 			"language_code": langCode,
+			"encoding":      "audio/wav",
 		},
 	}
 	if err := conn.WriteJSON(configPayload); err != nil {
@@ -79,9 +65,6 @@ func StreamSarvamSTT(ctx context.Context, audioChan <-chan []byte, transcriptCha
 	}
 
 	readerDone := make(chan struct{})
-
-	var lastTranscript string
-	var mu sync.Mutex
 
 	// Receiver loop
 	go func() {
@@ -128,15 +111,17 @@ func StreamSarvamSTT(ctx context.Context, audioChan <-chan []byte, transcriptCha
 				if transcript != "" {
 					log.Printf("[STT] %s (isFinal: %v)\n", transcript, isFinal)
 					
+					// Thread-safe update of the latest partial transcript
 					mu.Lock()
-					lastTranscript = transcript
+					lastTranscript.Reset()
+					lastTranscript.WriteString(transcript)
 					mu.Unlock()
 
 					if isFinal {
 						select {
 						case transcriptChan <- transcript:
 							mu.Lock()
-							lastTranscript = "" // Clear after sending
+							lastTranscript.Reset() // Clear after sending
 							mu.Unlock()
 						default:
 						}
@@ -147,7 +132,6 @@ func StreamSarvamSTT(ctx context.Context, audioChan <-chan []byte, transcriptCha
 	}()
 
 	// Sender loop (Pipe continuous JSON encoded PCM chunks)
-	hasSentAudio := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -159,6 +143,7 @@ func StreamSarvamSTT(ctx context.Context, audioChan <-chan []byte, transcriptCha
 				return nil
 			}
 
+			// Send raw PCM frame wrapped in JSON
 			msg := map[string]interface{}{
 				"audio": map[string]interface{}{
 					"data":        base64.StdEncoding.EncodeToString(chunk),
@@ -168,29 +153,6 @@ func StreamSarvamSTT(ctx context.Context, audioChan <-chan []byte, transcriptCha
 			}
 			if err := conn.WriteJSON(msg); err != nil {
 				return err
-			}
-			hasSentAudio = true
-		
-		case <-time.After(800 * time.Millisecond):
-			// If no audio for 800ms AND we have audio to flush, force it.
-			if hasSentAudio {
-				mu.Lock()
-				textToFlush := lastTranscript
-				lastTranscript = ""
-				mu.Unlock()
-
-				if textToFlush != "" {
-					log.Printf("[STT] Watchdog forcing transcript flush: %s\n", textToFlush)
-					select {
-					case transcriptChan <- textToFlush:
-					default:
-					}
-				}
-
-				// Also send the flush signal to Sarvam to keep them in sync
-				flushMsg := map[string]string{"type": "flush"}
-				conn.WriteJSON(flushMsg)
-				hasSentAudio = false
 			}
 		}
 	}

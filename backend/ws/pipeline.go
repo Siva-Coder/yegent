@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"regexp"
@@ -127,8 +128,10 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 	}
 
 	// 1. Start Continuous STT Worker
+	var lastTranscript strings.Builder
+	var lastTranscriptMu sync.Mutex
 	go func() {
-		err := api.StreamSarvamSTT(pipelineCtx, audioChan, transcriptChan, campaign.LanguagePreference)
+		err := api.StreamSarvamSTT(pipelineCtx, audioChan, transcriptChan, campaign.LanguagePreference, &lastTranscript, &lastTranscriptMu)
 		if err != nil {
 			log.Println("STT Stream ending:", err)
 		}
@@ -193,7 +196,15 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 				llmMutex.Unlock()
 
 				userMessage := transcript
-				log.Println("AI evaluating:", userMessage)
+				
+				// Phase 14: Semantic Search (RAG)
+				contextText, _ := api.SearchKnowledgeBase(reqCtx, userMessage)
+				if contextText != "" {
+					log.Println("RAG context retrieved, enriching prompt.")
+					userMessage = fmt.Sprintf("KNOWLEDGE BASE CONTEXT:\n%s\n\nUSER SAID: %s", contextText, userMessage)
+				}
+				
+				log.Println("AI evaluating:", transcript)
 
 				llmLocalChan := make(chan string, 100)
 				go api.StreamLLM(reqCtx, systemPrompt, userMessage, llmLocalChan)
@@ -297,18 +308,35 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 				log.Println("Warning: audioChan full, dropping frame")
 			}
 		} else if mt == websocket.TextMessage {
-			// Handle "barge_in" signal if needed, though continuous STT might implicitly handle it.
-			// Just in case, if the frontend sends a barge_in string, kill ongoing LLMs.
-			if strings.Contains(string(msg), "barge_in") {
+			var signal struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(msg, &signal); err != nil {
+				continue
+			}
+
+			if signal.Type == "barge_in" {
 				llmMutex.Lock()
 				if llmCancel != nil {
 					llmCancel()
 				}
 				llmMutex.Unlock()
 				log.Println("Barge-in detected, halted AI output.")
-				
-				// Optional: Tell frontend we accepted it
-				_ = conn.WriteMessage(websocket.TextMessage, []byte("barge_in_ok"))
+				conn.WriteMessage(websocket.TextMessage, []byte("barge_in_ok"))
+			} else if signal.Type == "speech_end" {
+				// Rapid endpointing: Pull what we have and trigger Gemini
+				lastTranscriptMu.Lock()
+				text := strings.TrimSpace(lastTranscript.String())
+				lastTranscript.Reset()
+				lastTranscriptMu.Unlock()
+
+				if text != "" {
+					log.Println("Speech End (Hark): Triggering LLM for:", text)
+					select {
+					case transcriptChan <- text:
+					default:
+					}
+				}
 			}
 		}
 	}

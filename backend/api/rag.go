@@ -3,13 +3,16 @@ package api
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"io"
+	"log"
+	"mime/multipart"
+	"os"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"os"
+	"github.com/ledongthuc/pdf"
 )
 
 // In a real app, this would be initialized in main and passed down
@@ -34,15 +37,6 @@ func initDB() {
 	}
 }
 
-// GenerateMockEmbedding simulates calling Sarvam or an embedding model
-func GenerateMockEmbedding(text string) []float32 {
-	// For pgvector 1536 dim
-	emb := make([]float32, 1536)
-	for i := range emb {
-		emb[i] = rand.Float32()
-	}
-	return emb
-}
 
 // chunkText splits text into roughly 500 token chunks (approximation via words)
 func chunkText(text string) []string {
@@ -74,17 +68,6 @@ func HandleDocumentUpload(c *fiber.Ctx) error {
 		workspaceIDStr = "11111111-1111-1111-1111-111111111111" // Default Mock Workspace
 	}
 
-	// Read file content
-	fileHeader, err := file.Open()
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to read file"})
-	}
-	defer fileHeader.Close()
-
-	buf := make([]byte, file.Size)
-	fileHeader.Read(buf)
-	content := string(buf) // Assuming plain text for this scaffolding
-
 	// 1. Create Document Record
 	docID := uuid.New().String()
 	if dbPool != nil {
@@ -96,12 +79,37 @@ func HandleDocumentUpload(c *fiber.Ctx) error {
 		}
 	}
 
-	// 2. Chunk & Embed
-	chunks := chunkText(content)
+	// 2. Extract Text
+	var content string
 	
-	// In reality we would batch these to Pgvector
+	if strings.HasSuffix(strings.ToLower(file.Filename), ".pdf") {
+		var err error
+		content, err = extractTextFromPDF(file)
+		if err != nil {
+			log.Printf("PDF extraction failed: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to parse PDF text"})
+		}
+	} else {
+		// Fallback for plain text files
+		f, _ := file.Open()
+		buf := make([]byte, file.Size)
+		f.Read(buf)
+		content = string(buf)
+		f.Close()
+	}
+
+	// 3. Chunk & Embed
+	chunks := chunkText(content)
+	successCount := 0
+	var lastErr error
+	
 	for _, chunk := range chunks {
-		embedding := GenerateMockEmbedding(chunk)
+		embedding, err := GetGeminiEmbedding(chunk)
+		if err != nil {
+			log.Printf("Embedding failed for chunk: %v", err)
+			lastErr = err
+			continue
+		}
 		
 		// Pgvector string representation for INSERT: '[0.1, 0.2, ...]'
 		embStr := "["
@@ -118,12 +126,60 @@ func HandleDocumentUpload(c *fiber.Ctx) error {
 			_, err = dbPool.Exec(context.Background(),
 				"INSERT INTO document_chunks (id, document_id, workspace_id, content, embedding) VALUES ($1, $2, $3, $4, $5)",
 				chunkID, docID, workspaceIDStr, chunk, embStr)
+			if err == nil {
+				successCount++
+			} else {
+				lastErr = err
+			}
 		}
 	}
 
+	if successCount == 0 && len(chunks) > 0 {
+		return c.Status(500).JSON(fiber.Map{
+			"error": fmt.Sprintf("Failed to embed document chunks: %v", lastErr),
+		})
+	}
+
 	return c.JSON(fiber.Map{
-		"message": "Document uploaded and embedded successfully",
-		"document_id": docID,
-		"chunks_created": len(chunks),
+		"message":        fmt.Sprintf("Document uploaded: %d/%d chunks embedded successfully", successCount, len(chunks)),
+		"document_id":    docID,
+		"chunks_created": successCount,
 	})
+}
+
+func extractTextFromPDF(fileHeader *multipart.FileHeader) (string, error) {
+	f, err := fileHeader.Open()
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	// Create a temporary file because the PDF parser requires a file path/ReaderAt
+	tempFile, err := os.CreateTemp("", "upload-*.pdf")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tempFile.Name()) // Clean up after we are done
+	defer tempFile.Close()
+
+	if _, err := io.Copy(tempFile, f); err != nil {
+		return "", err
+	}
+
+	_, pdfReader, err := pdf.Open(tempFile.Name())
+	if err != nil {
+		return "", err
+	}
+
+	var textBuilder strings.Builder
+	for i := 1; i <= pdfReader.NumPage(); i++ {
+		p := pdfReader.Page(i)
+		if p.V.IsNull() {
+			continue
+		}
+		s, _ := p.GetPlainText(nil)
+		textBuilder.WriteString(s)
+		textBuilder.WriteString("\n")
+	}
+	return textBuilder.String(), nil
 }
