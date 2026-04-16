@@ -5,14 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
-	"yegent-backend/api" // Make sure to use your project's module name. wait, I'll use relative or just "yegent-backend/api" if it was that. Wait, the original pipeline.go used what? Let me check how it imported api.
-
-	"os"
-
+	"yegent-backend/api"
+	"yegent-backend/middleware"
 	"github.com/gofiber/contrib/websocket"
 	"github.com/supabase-community/supabase-go"
 )
@@ -27,13 +27,29 @@ type Campaign struct {
 
 // HandleCallSocket bridges the Fiber HTTP request into the websocket connection loop
 var HandleCallSocket = websocket.New(func(c *websocket.Conn) {
+	token := c.Query("token")
 	campaignID := c.Query("campaign_id")
-	log.Println("New AI Voice Call connected! CampaignID:", campaignID)
-	RunPipeline(c, campaignID)
+	leadID := c.Query("lead_id")
+
+	log.Printf("WS: New connection attempt. CampaignID=%s", campaignID)
+
+	// Post-upgrade authentication
+	userID, err := middleware.VerifyToken(token)
+	if err != nil {
+		log.Printf("WS: Authentication failed: %v", err)
+		// Close with Unauthorized status
+		c.WriteControl(websocket.CloseMessage, 
+			websocket.FormatCloseMessage(4001, "Unauthorized: "+err.Error()), 
+			time.Now().Add(time.Second))
+		c.Close()
+		return
+	}
+
+	RunPipeline(c, campaignID, leadID, userID)
 })
 
 // RunPipeline orchestrates the continuous duplex streaming phase 8 architecture
-func RunPipeline(conn *websocket.Conn, campaignID string) {
+func RunPipeline(conn *websocket.Conn, campaignID string, leadID string, userID string) {
 	defer conn.Close()
 
 	var fullTranscript strings.Builder
@@ -88,6 +104,20 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 		}
 	}
 
+	// Phase 19: Dynamic Lead Context Injection
+	contextPrefix := ""
+	if leadID != "" {
+		lead, err := api.GetLeadByID(context.Background(), leadID)
+		if err == nil && lead != nil {
+			contextPrefix = fmt.Sprintf("CRITICAL CONTEXT: You are talking to %s. ", lead.Name)
+			if lead.Summary != "" {
+				contextPrefix += fmt.Sprintf("Context from previous calls: %s. ", lead.Summary)
+			}
+		} else {
+			log.Printf("Lead context injection skipped for ID %s: %v", leadID, err)
+		}
+	}
+
 	// 1. Map the language preference to a strict LLM instruction
 	languageRule := "pure English"
 	fillerWords := "'Well,', 'Hmm,', 'Okay,'"
@@ -103,7 +133,7 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 
 	// 2. Inject the dynamic rules into the system prompt
 	systemPrompt := fmt.Sprintf(
-		"You are %s. Your objective is: %s. "+
+		"%sYou are %s. Your objective is: %s. "+
 			"CRITICAL RULES: "+
 			"1. You are speaking on a live phone call in India. "+
 			"2. LANGUAGE: You MUST reply in %s "+
@@ -111,7 +141,7 @@ func RunPipeline(conn *websocket.Conn, campaignID string) {
 			"4. HUMAN CONVERSATION: Start your turns with natural filler words like %s. "+
 			"5. ANSWER DIRECTLY: No matter what the user asks, provide the exact answer immediately. NEVER use affirmative fluff or acknowledge the question (e.g., do NOT say 'That is a great question', 'Good choice', or 'I would love to help'). Get straight to the point but maintain a warm, human tone. "+
 			"6. Keep responses to a maximum of 2 short, punchy sentences. No lists or markdown.",
-		campaign.Persona, campaign.Objective, languageRule, fillerWords,
+		contextPrefix, campaign.Persona, campaign.Objective, languageRule, fillerWords,
 	)
 
 	pipelineCtx, cancelPipeline := context.WithCancel(context.Background())

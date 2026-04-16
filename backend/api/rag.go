@@ -63,17 +63,22 @@ func HandleDocumentUpload(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "Document file is required"})
 	}
 	
+	userID, ok := c.Locals("user_id").(string)
+	if !ok {
+		return c.Status(401).JSON(fiber.Map{"error": "Unauthorized: No user session"})
+	}
+
 	workspaceIDStr := c.FormValue("workspace_id")
 	if workspaceIDStr == "" {
-		workspaceIDStr = "11111111-1111-1111-1111-111111111111" // Default Mock Workspace
+		return c.Status(400).JSON(fiber.Map{"error": "workspace_id (campaign_id) is required"})
 	}
 
 	// 1. Create Document Record
 	docID := uuid.New().String()
 	if dbPool != nil {
 		_, err = dbPool.Exec(context.Background(), 
-			"INSERT INTO documents (id, workspace_id, name, content_type) VALUES ($1, $2, $3, $4)",
-			docID, workspaceIDStr, file.Filename, file.Header.Get("Content-Type"))
+			"INSERT INTO documents (id, user_id, workspace_id, name, content_type) VALUES ($1, $2, $3, $4, $5)",
+			docID, userID, workspaceIDStr, file.Filename, file.Header.Get("Content-Type"))
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "DB insert failed"})
 		}
@@ -145,6 +150,74 @@ func HandleDocumentUpload(c *fiber.Ctx) error {
 		"document_id":    docID,
 		"chunks_created": successCount,
 	})
+}
+
+func HandleListDocuments(c *fiber.Ctx) error {
+	initDB()
+	userID, ok := c.Locals("user_id").(string)
+	if !ok {
+		return c.Status(401).JSON(fiber.Map{"error": "Unauthorized"})
+	}
+
+	workspaceID := c.Query("workspace_id")
+	if workspaceID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "workspace_id is required"})
+	}
+
+	if dbPool == nil {
+		return c.Status(500).JSON(fiber.Map{"error": "DB connection not initialized"})
+	}
+
+	rows, err := dbPool.Query(context.Background(), 
+		"SELECT id, name, content_type, created_at FROM documents WHERE workspace_id = $1 AND user_id = $2 ORDER BY created_at DESC", 
+		workspaceID, userID)
+	if err != nil {
+		log.Printf("List query failed: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "DB query failed"})
+	}
+	defer rows.Close()
+
+	docs := []map[string]interface{}{}
+	for rows.Next() {
+		var id, name, contentType string
+		var createdAt interface{}
+		if err := rows.Scan(&id, &name, &contentType, &createdAt); err != nil {
+			continue
+		}
+		docs = append(docs, map[string]interface{}{
+			"id":           id,
+			"name":         name,
+			"content_type": contentType,
+			"created_at":   createdAt,
+		})
+	}
+
+	return c.JSON(docs)
+}
+
+func HandleDeleteDocument(c *fiber.Ctx) error {
+	initDB()
+	userID, ok := c.Locals("user_id").(string)
+	if !ok {
+		return c.Status(401).JSON(fiber.Map{"error": "Unauthorized"})
+	}
+
+	id := c.Params("id")
+	if id == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "document id is required"})
+	}
+
+	if dbPool == nil {
+		return c.Status(500).JSON(fiber.Map{"error": "DB connection not initialized"})
+	}
+
+	_, err := dbPool.Exec(context.Background(), "DELETE FROM documents WHERE id = $1 AND user_id = $2", id, userID)
+	if err != nil {
+		log.Printf("Delete failed: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to delete document"})
+	}
+
+	return c.JSON(fiber.Map{"message": "Document deleted successfully"})
 }
 
 func extractTextFromPDF(fileHeader *multipart.FileHeader) (string, error) {
